@@ -17,4 +17,4 @@ export DIFFUSERS_CACHE=$HF_HOME/diffusers
 
 mkdir -p "$HUGGINGFACE_HUB_CACHE" "$TRANSFORMERS_CACHE" "$DIFFUSERS_CACHE"
 
-python my_files/scripts/inference2.py
+python my_files/scripts/inference3.py
