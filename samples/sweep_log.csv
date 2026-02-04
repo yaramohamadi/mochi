@@ -1,0 +1,17 @@
+video_path,scenario,guidance_scale,guided_ratio,motion_scale,seed,cfg_uncond_reference,cfg_anchor_interval,num_frames,height,width,do_rescaling
+samples/CFG_Dropout_gs4.50_gr1.00_ms0.00_frames81_rescale0_seed42.mp4,CFG_Dropout,4.5,1.0,0.0,42,standard,25,81,480,480,False
+samples/CFG_Dropout_gs4.50_gr1.00_ms0.10_frames81_rescale0_seed42.mp4,CFG_Dropout,4.5,1.0,0.1,42,standard,25,81,480,480,False
+samples/CFG_Dropout_gs4.50_gr1.00_ms0.25_frames81_rescale0_seed42.mp4,CFG_Dropout,4.5,1.0,0.25,42,standard,25,81,480,480,False
+samples/CFG_Dropout_gs4.50_gr1.00_ms0.50_frames81_rescale0_seed42.mp4,CFG_Dropout,4.5,1.0,0.5,42,standard,25,81,480,480,False
+samples/CFG_Dropout_gs7.50_gr1.00_ms0.00_frames81_rescale0_seed42.mp4,CFG_Dropout,7.5,1.0,0.0,42,standard,25,81,480,480,False
+samples/CFG_Dropout_gs7.50_gr1.00_ms0.10_frames81_rescale0_seed42.mp4,CFG_Dropout,7.5,1.0,0.1,42,standard,25,81,480,480,False
+samples/CFG_Dropout_gs7.50_gr1.00_ms0.25_frames81_rescale0_seed42.mp4,CFG_Dropout,7.5,1.0,0.25,42,standard,25,81,480,480,False
+samples/CFG_Dropout_gs7.50_gr1.00_ms0.50_frames81_rescale0_seed42.mp4,CFG_Dropout,7.5,1.0,0.5,42,standard,25,81,480,480,False
+samples/CFG_Dropout_gs4.50_gr1.00_ms0.75_frames81_rescale0_seed42.mp4,CFG_Dropout,4.5,1.0,0.75,42,standard,25,81,480,480,False
+samples/CFG_Dropout_gs4.50_gr1.00_ms1.00_frames81_rescale0_seed42.mp4,CFG_Dropout,4.5,1.0,1,42,standard,25,81,480,480,False
+samples/CFG_Dropout_gs4.50_gr1.00_ms1.50_frames81_rescale0_seed42.mp4,CFG_Dropout,4.5,1.0,1.5,42,standard,25,81,480,480,False
+samples/CFG_Dropout_gs4.50_gr1.00_ms2.00_frames81_rescale0_seed42.mp4,CFG_Dropout,4.5,1.0,2,42,standard,25,81,480,480,False
+samples/CFG_Dropout_gs7.50_gr1.00_ms0.75_frames81_rescale0_seed42.mp4,CFG_Dropout,7.5,1.0,0.75,42,standard,25,81,480,480,False
+samples/CFG_Dropout_gs7.50_gr1.00_ms1.00_frames81_rescale0_seed42.mp4,CFG_Dropout,7.5,1.0,1,42,standard,25,81,480,480,False
+samples/CFG_Dropout_gs7.50_gr1.00_ms1.50_frames81_rescale0_seed42.mp4,CFG_Dropout,7.5,1.0,1.5,42,standard,25,81,480,480,False
+samples/CFG_Dropout_gs7.50_gr1.00_ms2.00_frames81_rescale0_seed42.mp4,CFG_Dropout,7.5,1.0,2,42,standard,25,81,480,480,False

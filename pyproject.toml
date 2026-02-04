@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "addict>=2.4.0",
-    "av==13.1.0",
+    "av>=11,<14",
     "click>=8.1.7",
     "einops>=0.8.0",
     "gradio>=3.36.1",
@@ -35,3 +35,5 @@ torchvision = [
 [tool.ruff]
 # Allow lines to be as long as 120.
 line-length = 120
+
+# av==13.1.0

@@ -559,6 +559,10 @@ class MochiSTGPipeline(DiffusionPipeline, Mochi1LoraLoaderMixin):
         stg_applied_layers_idx: Optional[List[int]] = [34],
         stg_scale: Optional[float] = 0.0,
         do_rescaling: Optional[bool] = False,
+        # CFG Distillation 
+        cfg_uncond_reference: str = "standard",  # "standard" | "first" | "nearest"
+        cfg_anchor_interval: int = 25,           # interval in OUTPUT frames (only used for "nearest")
+
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -689,6 +693,12 @@ class MochiSTGPipeline(DiffusionPipeline, Mochi1LoraLoaderMixin):
             max_sequence_length=max_sequence_length,
             device=device,
         )
+
+        prompt_embeds_text = prompt_embeds
+        prompt_mask_text   = prompt_attention_mask
+        prompt_embeds_uncond = negative_prompt_embeds
+        prompt_mask_uncond   = negative_prompt_attention_mask
+
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels
         latents = self.prepare_latents(
@@ -735,15 +745,19 @@ class MochiSTGPipeline(DiffusionPipeline, Mochi1LoraLoaderMixin):
                 # Note: Mochi uses reversed timesteps. To ensure compatibility with methods like FasterCache, we need
                 # to make sure we're using the correct non-reversed timestep value.
                 self._current_timestep = 1000 - t
+
+                # build model input (this is where the 2x / 3x batch happens)
                 if self.do_classifier_free_guidance and not self.do_spatio_temporal_guidance:
                     latent_model_input = torch.cat([latents] * 2)
                 elif self.do_classifier_free_guidance and self.do_spatio_temporal_guidance:
                     latent_model_input = torch.cat([latents] * 3)
                 else:
                     latent_model_input = latents
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+
+                # timestep broadcast
                 timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype)
 
+                # forward pass (noise_pred MUST be computed before chunking)
                 noise_pred = self.transformer(
                     hidden_states=latent_model_input,
                     encoder_hidden_states=prompt_embeds,
@@ -752,22 +766,61 @@ class MochiSTGPipeline(DiffusionPipeline, Mochi1LoraLoaderMixin):
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                 )[0]
-                # Mochi CFG + Sampling runs in FP32
                 noise_pred = noise_pred.to(torch.float32)
 
+                # ---- Guidance combine (CUSTOM for CFG, original for STG) ----
                 if self.do_classifier_free_guidance and not self.do_spatio_temporal_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                    if cfg_uncond_reference == "standard":
+                        uncond_ref = noise_pred_uncond
+
+                    elif cfg_uncond_reference == "first":
+                        uncond_ref = noise_pred_uncond[:, :, 0:1, :, :].expand_as(noise_pred_uncond)
+
+                    elif cfg_uncond_reference == "nearest":
+                        F = noise_pred_uncond.shape[2]
+                        interval_lat = max(1, cfg_anchor_interval // self.vae_temporal_scale_factor)
+
+                        anchors = torch.arange(0, F, interval_lat, device=noise_pred.device, dtype=torch.long)
+                        if anchors[-1].item() != F - 1:
+                            anchors = torch.cat([anchors, anchors.new_tensor([F - 1])])
+
+                        frames = torch.arange(F, device=noise_pred.device, dtype=torch.long)
+
+                        right = torch.bucketize(frames, anchors)
+                        left = (right - 1).clamp(0, anchors.numel() - 1)
+                        right = right.clamp(0, anchors.numel() - 1)
+
+                        dist_left = (frames - anchors[left]).abs()
+                        dist_right = (anchors[right] - frames).abs()
+                        pick_right = dist_right < dist_left
+
+                        nearest_anchor_idx = torch.where(pick_right, right, left)
+                        ref_t = anchors[nearest_anchor_idx]
+
+                        uncond_ref = noise_pred_uncond.index_select(dim=2, index=ref_t)
+
+                    else:
+                        raise ValueError(f"Unknown cfg_uncond_reference: {cfg_uncond_reference}")
+
+                    noise_pred = uncond_ref + self.guidance_scale * (noise_pred_text - uncond_ref)
+
                 elif self.do_classifier_free_guidance and self.do_spatio_temporal_guidance:
                     noise_pred_uncond, noise_pred_text, noise_pred_perturb = noise_pred.chunk(3)
-                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond) \
+                    noise_pred = (
+                        noise_pred_uncond
+                        + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
                         + self._stg_scale * (noise_pred_text - noise_pred_perturb)
-                        
-                if do_rescaling:
+                    )
+
+                # rescaling (only safe when CFG/STG is on because it uses noise_pred_text)
+                if do_rescaling and self.do_classifier_free_guidance:
                     rescaling_scale = 0.7
                     factor = noise_pred_text.std() / noise_pred.std()
                     factor = rescaling_scale * factor + (1 - rescaling_scale)
                     noise_pred = noise_pred * factor
+
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
