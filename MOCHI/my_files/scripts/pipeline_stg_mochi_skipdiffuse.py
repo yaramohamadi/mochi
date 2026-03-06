@@ -151,7 +151,7 @@ def linear_quadratic_schedule(num_steps, threshold_noise, linear_steps=None):
         quadratic_coef * (i**2) + linear_coef * i + const for i in range(linear_steps, num_steps)
     ]
     sigma_schedule = linear_sigma_schedule + quadratic_sigma_schedule
-    sigma_schedule = [1.0 - x for x in sigma_schedule]
+    sigma_schedule = [1 - x for x in sigma_schedule]
     return sigma_schedule
 
 
@@ -304,6 +304,36 @@ class MochiSTGPipeline(DiffusionPipeline, Mochi1LoraLoaderMixin):
         self.default_height = 480
         self.default_width = 848
         self.register_to_config(force_zeros_for_empty_prompt=force_zeros_for_empty_prompt)
+
+
+    def _noisify_latents_to_step(self, latents: torch.Tensor, i_from: int, i_to: int, generator=None) -> torch.Tensor:
+        """
+        Approximate x_{t_to} from x_{t_from} by adding the extra noise needed to match sigma(t_to).
+        Assumes scheduler exposes `sigmas` aligned with inference steps.
+        """
+        if i_to == i_from:
+            return latents
+        if not hasattr(self.scheduler, "sigmas"):
+            # Fallback: can't compute sigma diff -> no change
+            return latents
+
+        sigmas = torch.as_tensor(self.scheduler.sigmas, device=latents.device, dtype=torch.float32)
+        i_from = min(max(i_from, 0), sigmas.numel() - 1)
+        i_to   = min(max(i_to,   0), sigmas.numel() - 1)
+
+        sigma_from = sigmas[i_from]
+        sigma_to   = sigmas[i_to]
+
+        # We only support shifting toward *more noise* (sigma_to >= sigma_from)
+        if sigma_to <= sigma_from:
+            return latents
+
+        sigma_inc = torch.sqrt(torch.clamp(sigma_to * sigma_to - sigma_from * sigma_from, min=0.0))
+        noise = randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=torch.float32)
+
+        out = latents.to(torch.float32) + sigma_inc * noise
+        return out.to(latents.dtype)
+
 
     def _get_t5_prompt_embeds(
         self,
@@ -643,6 +673,15 @@ class MochiSTGPipeline(DiffusionPipeline, Mochi1LoraLoaderMixin):
         motion_scale: float = 0.0,         # 0 disables
         motion_detach_prev: bool = True,   # safer
         motion_only_from_frame: int = 1,   # keep frame 0 unchanged
+        # CFG time-shift 
+        cfg_uncond_delta_steps: int = 0,  # δ in *inference-step index* units (0 = baseline)
+        skip_stride: int = 1,   # 1 = baseline, 2 = keep every other step, etc.
+        cfg_uncond_delta_mode: str = "pred_uncond",   # "randn" (old) | "pred_uncond" | "pred_text"
+        cfg_uncond_delta_strength: float = 1.0,       # scales the delta push
+        # timestep_guidance + CFG
+        timestep_guidance_scale: float = 0.0,
+        timestep_guidance_norm: bool = True,
+        timestep_guidance_delta_steps: int = 0
 
     ):
         r"""
@@ -818,15 +857,27 @@ class MochiSTGPipeline(DiffusionPipeline, Mochi1LoraLoaderMixin):
             prompt_embeds = prompt_embeds_text
             prompt_attention_mask = prompt_mask_text
 
-
-        # 5. Prepare timestep
-        # from https://github.com/genmoai/models/blob/075b6e36db58f1242921deff83a1066887b9c9e1/src/mochi_preview/infer.py#L77
         threshold_noise = 0.025
         sigmas = linear_quadratic_schedule(num_inference_steps, threshold_noise)
-        sigmas = np.array(sigmas)
+        sigmas = np.array(sigmas, dtype=np.float64)
 
-        print("Sigmas")
+        print("Sigmas ")
         print(sigmas)
+        # ✅ NEW: stride skip
+        if skip_stride is None:
+            skip_stride = 1
+        skip_stride = max(1, int(skip_stride))
+
+        if skip_stride > 1:
+            idx = list(range(0, len(sigmas), skip_stride))
+            if idx[-1] != len(sigmas) - 1:
+                idx.append(len(sigmas) - 1)   # always keep the last step
+            sigmas = sigmas[idx]
+            num_inference_steps = len(sigmas)
+
+        print("After striding")
+        print(sigmas)
+        print("num inference steps:", num_inference_steps)
 
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
@@ -835,12 +886,33 @@ class MochiSTGPipeline(DiffusionPipeline, Mochi1LoraLoaderMixin):
             timesteps,
             sigmas,
         )
+        
+        print("retrieving timesteps")
         print("timesteps:")
         print(timesteps)
+        print("num_inference_steps: ", num_inference_steps)
+
+        sigmas_torch = torch.as_tensor(sigmas, device=device, dtype=torch.float32)
+
+        print("sigmas_torch")
+        print(sigmas_torch)
+        sigmas_torch = sigmas_torch[: len(timesteps)]
+        print(sigmas_torch)
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
-        exit()
+        N = sigmas_torch.numel()
+        # sigma_increasing = bool(sigmas_torch[0] < sigmas_torch[-1])
+
+        def idx_more_noisy(i, delta):
+            if delta <= 0:
+                return i
+            # “more noisy” = larger sigma
+            return max(0, i - delta) # min(N - 1, i + delta) if sigma_increasing else 
+
+
+        prev_v_text = None
+        prev_sigma_t = None
 
         # 6. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -922,119 +994,256 @@ class MochiSTGPipeline(DiffusionPipeline, Mochi1LoraLoaderMixin):
 
 
                 else:
-                    # build model input (this is where the 2x / 3x batch happens)
-                    if self.do_classifier_free_guidance and not self.do_spatio_temporal_guidance:
-                        latent_model_input = torch.cat([latents] * 2)
-                    elif self.do_classifier_free_guidance and self.do_spatio_temporal_guidance:
-                        latent_model_input = torch.cat([latents] * 3)
-                    else:
-                        latent_model_input = latents
+                    # ===================== (A) pred_text delta-CFG (2 forwards, no 2B batch) =====================
+                    if (
+                        self.do_classifier_free_guidance
+                        and (not self.do_spatio_temporal_guidance)
+                        and (cfg_uncond_delta_steps > 0)
+                        and (cfg_uncond_delta_mode == "pred_text")
+                    ):
+                        delta = int(cfg_uncond_delta_steps)
+                        i_u = idx_more_noisy(i, delta)
 
-                    # timestep broadcast
-                    timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype)
+                        print("----------------------------")
+                        print(f"[delta check] i={i}, i_u={i_u}, sigma_t={sigmas_torch[i].item():.6g}, sigma_u={sigmas_torch[i_u].item():.6g}")
+                        print("----------------------------")
 
-                    # forward pass (noise_pred MUST be computed before chunking)
-                    noise_pred = self.transformer(
-                        hidden_states=latent_model_input,
-                        encoder_hidden_states=prompt_embeds,
-                        timestep=timestep,
-                        encoder_attention_mask=prompt_attention_mask,
-                        attention_kwargs=attention_kwargs,
-                        return_dict=False,
-                    )[0]
-                    noise_pred = noise_pred.to(torch.float32)
+                        sigma_t = sigmas_torch[i]
+                        sigma_u = sigmas_torch[i_u]
 
-                    # ---- Guidance combine (CUSTOM for CFG, original for STG) ----
-                    if self.do_classifier_free_guidance and not self.do_spatio_temporal_guidance:
-                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        # 1) conditional at (x_t, t)
+                        noise_pred_text = self.transformer(
+                            hidden_states=latents,
+                            encoder_hidden_states=prompt_embeds_text,
+                            timestep=t.expand(B).to(latents.dtype),
+                            encoder_attention_mask=prompt_mask_text,
+                            attention_kwargs=attention_kwargs,
+                            return_dict=False,
+                        )[0].to(torch.float32)
 
+                        # 2) unconditional reference (either shifted to more-noisy sigma, or fallback)
+                        if sigma_u > sigma_t:
+                            
+                            dt = (sigma_t - sigma_u).to(torch.float32)
+                            print("dt   ", dt)
+                            # model_output in FlowMatchEuler is a velocity field
+                            v_text = noise_pred_text.to(torch.float32)
+
+                            # Move to sigma_u along the model's predicted flow
+                            latents_uncond_shift = (latents.to(torch.float32) + dt * v_text).to(latents.dtype)
+                            t_u = timesteps[i_u]
+
+                            noise_pred_uncond = self.transformer(
+                                hidden_states=latents_uncond_shift,
+                                encoder_hidden_states=prompt_embeds_uncond,
+                                timestep=t_u.expand(B).to(latents.dtype),
+                                encoder_attention_mask=prompt_mask_uncond,
+                                attention_kwargs=attention_kwargs,
+                                return_dict=False,
+                            )[0].to(torch.float32)
+                        else:
+                            # no valid "more-noise" shift -> just use standard uncond at (x_t, t)
+                            noise_pred_uncond = self.transformer(
+                                hidden_states=latents,
+                                encoder_hidden_states=prompt_embeds_uncond,
+                                timestep=t.expand(B).to(latents.dtype),
+                                encoder_attention_mask=prompt_mask_uncond,
+                                attention_kwargs=attention_kwargs,
+                                return_dict=False,
+                            )[0].to(torch.float32)
+
+                        # Keep your cfg_uncond_reference behavior (start with standard)
                         if cfg_uncond_reference == "standard":
-                            uncond_ref = noise_pred_uncond
-
+                            uncond_ref = noise_pred_uncond  
                         elif cfg_uncond_reference == "first":
                             uncond_ref = noise_pred_uncond[:, :, 0:1, :, :].expand_as(noise_pred_uncond)
-
-                        elif cfg_uncond_reference == "nearest":
-                            F1 = noise_pred_uncond.shape[2]
-                            interval_lat = max(1, cfg_anchor_interval // self.vae_temporal_scale_factor)
-
-                            anchors = torch.arange(0, F1, interval_lat, device=noise_pred.device, dtype=torch.long)
-                            if anchors[-1].item() != F1 - 1:
-                                anchors = torch.cat([anchors, anchors.new_tensor([F1 - 1])])
-
-                            frames = torch.arange(F1, device=noise_pred.device, dtype=torch.long)
-
-                            right = torch.bucketize(frames, anchors)
-                            left = (right - 1).clamp(0, anchors.numel() - 1)
-                            right = right.clamp(0, anchors.numel() - 1)
-
-                            dist_left = (frames - anchors[left]).abs()
-                            dist_right = (anchors[right] - frames).abs()
-                            pick_right = dist_right < dist_left
-
-                            nearest_anchor_idx = torch.where(pick_right, right, left)
-                            ref_t = anchors[nearest_anchor_idx]
-
-                            uncond_ref = noise_pred_uncond.index_select(dim=2, index=ref_t)
-
-                        elif cfg_uncond_reference == "weighted":
-                            F1 = noise_pred_uncond.shape[2]
-                            interval_lat = max(1, cfg_anchor_interval // self.vae_temporal_scale_factor)
-
-                            anchors = torch.arange(0, F1, interval_lat, device=noise_pred.device, dtype=torch.long)
-                            if anchors[-1].item() != F1 - 1:
-                                anchors = torch.cat([anchors, anchors.new_tensor([F1 - 1])])
-
-                            frames = torch.arange(F1, device=noise_pred.device, dtype=torch.long)  # [F]
-
-                            # indices into anchors list
-                            right = torch.bucketize(frames, anchors)  # [F] in [0..len(anchors)]
-                            left = (right - 1).clamp(0, anchors.numel() - 1)
-                            right = right.clamp(0, anchors.numel() - 1)
-
-                            # distances in frame units
-                            dist_left = (frames - anchors[left]).abs().to(torch.float32)     # [F]
-                            dist_right = (anchors[right] - frames).abs().to(torch.float32)   # [F]
-
-                            den = dist_left + dist_right  # [F]
-                            den_safe = torch.where(den == 0, torch.ones_like(den), den)
-
-                            # weight toward RIGHT anchor increases as you get closer to RIGHT
-                            w_right = (dist_left / den_safe)  # [F]
-                            w_left = 1.0 - w_right            # [F]
-
-                            # gather uncond at left/right anchor frame positions (in the *video timeline*)
-                            left_t = anchors[left]    # [F] actual frame indices
-                            right_t = anchors[right]  # [F]
-
-                            uncond_left = noise_pred_uncond.index_select(dim=2, index=left_t)    # [B,C,F,H,W]
-                            uncond_right = noise_pred_uncond.index_select(dim=2, index=right_t)  # [B,C,F,H,W]
-
-                            # broadcast weights to [B,C,F,H,W]
-                            w_left = w_left.view(1, 1, F1, 1, 1)
-                            w_right = w_right.view(1, 1, F1, 1, 1)
-
-                            uncond_ref = w_left * uncond_left + w_right * uncond_right
-
+                        elif cfg_uncond_reference in ["nearest", "weighted"]:
+                            # (reuse your existing nearest/weighted code block here unchanged)
+                            # easiest: copy/paste the existing elif branches from below.
+                            raise NotImplementedError("Copy your existing nearest/weighted branches here.")
                         else:
                             raise ValueError(f"Unknown cfg_uncond_reference: {cfg_uncond_reference}")
 
-                        g = frame_guidance_mask.view(1, 1, -1, 1, 1).to(noise_pred_text.dtype)  # [1,1,F,1,1]
+                        g = frame_guidance_mask.view(1, 1, -1, 1, 1).to(noise_pred_text.dtype)
                         s_eff = 1.0 + g * (self.guidance_scale - 1.0)
 
-                        # CFG (with dropout via s_eff)
                         noise_pred = uncond_ref + s_eff * (noise_pred_text - uncond_ref)
-
-                        # Motion guidance as extra term near CFG
                         noise_pred = self._apply_motion_guidance(noise_pred, motion_base=noise_pred_text)
 
-                    elif self.do_classifier_free_guidance and self.do_spatio_temporal_guidance:
-                        noise_pred_uncond, noise_pred_text, noise_pred_perturb = noise_pred.chunk(3)
-                        noise_pred = (
-                            noise_pred_uncond
-                            + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
-                            + self._stg_scale * (noise_pred_text - noise_pred_perturb)
-                        )
+                    # ===================== otherwise: fall back to your existing batch CFG/STG code =====================
+                    else:
+                        # build model input (this is where the 2x / 3x batch happens)
+                        if self.do_classifier_free_guidance and not self.do_spatio_temporal_guidance:
+                            if cfg_uncond_delta_steps > 0 and cfg_uncond_delta_mode == "randn":
+                                i_u = idx_more_noisy(i, int(cfg_uncond_delta_steps))
+                                sigma_t = sigmas_torch[i]
+                                sigma_u = sigmas_torch[i_u]
+
+                                if sigma_u > sigma_t:
+                                    t_u = timesteps[i_u]
+                                    latents_uncond = self._noisify_latents_to_step(latents, i_from=i, i_to=i_u, generator=generator)
+                                else:
+                                    # fallback: do standard uncond at (x_t, t)
+                                    i_u = i
+                                    t_u = t
+                                    latents_uncond = latents
+                                latent_model_input = torch.cat([latents_uncond, latents], dim=0)
+                                timestep = torch.cat([t_u.expand(B), t.expand(B)], dim=0).to(latents.dtype)
+
+                            elif cfg_uncond_delta_steps > 0 and cfg_uncond_delta_mode in ["pred_uncond", "pred_text"]:
+                                # Option C: first get BOTH preds at (x_t, t) using the standard 2B batch
+                                latent_model_input = torch.cat([latents, latents], dim=0)
+                                timestep = t.expand(2 * B).to(latents.dtype)
+
+                            else:
+                                latent_model_input = torch.cat([latents, latents], dim=0)
+                                timestep = t.expand(2 * B).to(latents.dtype)
+
+                        elif self.do_classifier_free_guidance and self.do_spatio_temporal_guidance:
+                            latent_model_input = torch.cat([latents] * 3)
+                            timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype)
+                        else:
+                            latent_model_input = latents
+                            timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype)
+
+                        # forward pass (noise_pred MUST be computed before chunking)
+                        noise_pred = self.transformer(
+                            hidden_states=latent_model_input,
+                            encoder_hidden_states=prompt_embeds,
+                            timestep=timestep,
+                            encoder_attention_mask=prompt_attention_mask,
+                            attention_kwargs=attention_kwargs,
+                            return_dict=False,
+                        )[0]
+                        noise_pred = noise_pred.to(torch.float32)
+
+                        # ---- Guidance combine (CUSTOM for CFG, original for STG) ----
+                        if self.do_classifier_free_guidance and not self.do_spatio_temporal_guidance:
+                            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+
+                            if cfg_uncond_reference == "standard":
+                                uncond_ref = noise_pred_uncond
+
+                            elif cfg_uncond_reference == "first":
+                                uncond_ref = noise_pred_uncond[:, :, 0:1, :, :].expand_as(noise_pred_uncond)
+
+                            elif cfg_uncond_reference == "nearest":
+                                F1 = noise_pred_uncond.shape[2]
+                                interval_lat = max(1, cfg_anchor_interval // self.vae_temporal_scale_factor)
+
+                                anchors = torch.arange(0, F1, interval_lat, device=noise_pred.device, dtype=torch.long)
+                                if anchors[-1].item() != F1 - 1:
+                                    anchors = torch.cat([anchors, anchors.new_tensor([F1 - 1])])
+
+                                frames = torch.arange(F1, device=noise_pred.device, dtype=torch.long)
+
+                                right = torch.bucketize(frames, anchors)
+                                left = (right - 1).clamp(0, anchors.numel() - 1)
+                                right = right.clamp(0, anchors.numel() - 1)
+
+                                dist_left = (frames - anchors[left]).abs()
+                                dist_right = (anchors[right] - frames).abs()
+                                pick_right = dist_right < dist_left
+
+                                nearest_anchor_idx = torch.where(pick_right, right, left)
+                                ref_t = anchors[nearest_anchor_idx]
+
+                                uncond_ref = noise_pred_uncond.index_select(dim=2, index=ref_t)
+
+                            elif cfg_uncond_reference == "weighted":
+                                F1 = noise_pred_uncond.shape[2]
+                                interval_lat = max(1, cfg_anchor_interval // self.vae_temporal_scale_factor)
+
+                                anchors = torch.arange(0, F1, interval_lat, device=noise_pred.device, dtype=torch.long)
+                                if anchors[-1].item() != F1 - 1:
+                                    anchors = torch.cat([anchors, anchors.new_tensor([F1 - 1])])
+
+                                frames = torch.arange(F1, device=noise_pred.device, dtype=torch.long)  # [F]
+
+                                # indices into anchors list
+                                right = torch.bucketize(frames, anchors)  # [F] in [0..len(anchors)]
+                                left = (right - 1).clamp(0, anchors.numel() - 1)
+                                right = right.clamp(0, anchors.numel() - 1)
+
+                                # distances in frame units
+                                dist_left = (frames - anchors[left]).abs().to(torch.float32)     # [F]
+                                dist_right = (anchors[right] - frames).abs().to(torch.float32)   # [F]
+
+                                den = dist_left + dist_right  # [F]
+                                den_safe = torch.where(den == 0, torch.ones_like(den), den)
+
+                                # weight toward RIGHT anchor increases as you get closer to RIGHT
+                                w_right = (dist_left / den_safe)  # [F]
+                                w_left = 1.0 - w_right            # [F]
+
+                                # gather uncond at left/right anchor frame positions (in the *video timeline*)
+                                left_t = anchors[left]    # [F] actual frame indices
+                                right_t = anchors[right]  # [F]
+
+                                uncond_left = noise_pred_uncond.index_select(dim=2, index=left_t)    # [B,C,F,H,W]
+                                uncond_right = noise_pred_uncond.index_select(dim=2, index=right_t)  # [B,C,F,H,W]
+
+                                # broadcast weights to [B,C,F,H,W]
+                                w_left = w_left.view(1, 1, F1, 1, 1)
+                                w_right = w_right.view(1, 1, F1, 1, 1)
+
+                                uncond_ref = w_left * uncond_left + w_right * uncond_right
+
+                            else:
+                                raise ValueError(f"Unknown cfg_uncond_reference: {cfg_uncond_reference}")
+
+                            g = frame_guidance_mask.view(1, 1, -1, 1, 1).to(noise_pred_text.dtype)  # [1,1,F,1,1]
+                            s_eff = 1.0 + g * (self.guidance_scale - 1.0)
+
+                            # CFG (with dropout via s_eff)
+                            noise_pred = uncond_ref + s_eff * (noise_pred_text - uncond_ref)
+
+                            
+                            # ----------------------------
+                            # Time-step guidance (extra conditional delta branch)
+                            # ----------------------------
+                            if timestep_guidance_scale > 0.0:
+                                delta = int(timestep_guidance_delta_steps)  # reuse your existing delta arg (or add a new one)
+                                if delta > 0:
+                                    i_u = max(0, i - delta)
+
+                                    sigma_t = sigmas_torch[i]
+                                    sigma_u = sigmas_torch[i_u]
+                                    t_u     = timesteps[i_u]
+
+                                    dt = (sigma_t - sigma_u).to(torch.float32)  # should be >=0 if i_u is "more noisy"
+
+                                    v_t = noise_pred_text.to(torch.float32)
+                                    latents_shift = (latents.to(torch.float32) + dt * v_t).to(latents.dtype)
+
+                                    v_u = self.transformer(
+                                        hidden_states=latents_shift,
+                                        encoder_hidden_states=prompt_embeds_text,
+                                        timestep=t_u.expand(B).to(latents.dtype),
+                                        encoder_attention_mask=prompt_mask_text,
+                                        attention_kwargs=attention_kwargs,
+                                        return_dict=False,
+                                    )[0].to(torch.float32)
+
+                                    time_guidance_term = (v_t - v_u)
+
+                                    if timestep_guidance_norm:
+                                        time_guidance_term = time_guidance_term / dt.abs().clamp_min(1e-6)
+
+                                    # optional: apply same frame mask
+                                    g = frame_guidance_mask.view(1, 1, -1, 1, 1).to(time_guidance_term.dtype)
+                                    noise_pred = noise_pred + timestep_guidance_scale * (g * time_guidance_term)
+
+                            # Motion guidance as extra term near CFG
+                            noise_pred = self._apply_motion_guidance(noise_pred, motion_base=noise_pred_text)
+
+                        elif self.do_classifier_free_guidance and self.do_spatio_temporal_guidance:
+                            noise_pred_uncond, noise_pred_text, noise_pred_perturb = noise_pred.chunk(3)
+                            noise_pred = (
+                                noise_pred_uncond
+                                + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                                + self._stg_scale * (noise_pred_text - noise_pred_perturb)
+                            )
 
                 # rescaling (only safe when CFG/STG is on because it uses noise_pred_text)
                 if do_rescaling and self.do_classifier_free_guidance:
